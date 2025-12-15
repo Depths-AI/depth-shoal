@@ -1,0 +1,11 @@
+[package]
+name = "shoal-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }

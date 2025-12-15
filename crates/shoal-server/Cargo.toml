@@ -1,0 +1,13 @@
+[package]
+name = "shoal-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "depth-shoal"
+path = "src/main.rs"
+
+[dependencies]
+shoal-core = { path = "../shoal-core" }
+clap = { workspace = true }
