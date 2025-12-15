@@ -1,20 +1,21 @@
-//! `shoal-core` is the single library crate that holds all core Depth Shoal logic.
+//! Depth Shoal core library.
 
-pub mod prelude {
-    //! Re-export common types once we start defining them.
-}
+pub mod error;
+pub mod ndjson;
+pub mod spec;
 
-/// Returns the crate version at compile time.
+pub use error::{Result, ShoalError};
+pub use ndjson::{NdjsonDecoder, NdjsonOptions};
+pub use spec::{FieldName, Ident, ShoalDataType, ShoalField, ShoalSchema, TableName};
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn version_is_non_empty() {
-        assert!(!version().is_empty());
+        assert!(!crate::version().is_empty());
     }
 }
