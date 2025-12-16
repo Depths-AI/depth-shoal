@@ -100,7 +100,7 @@ impl Default for ShoalTableConfig {
     fn default() -> Self {
         Self {
             head_max_rows: 10_000,
-            head_max_bytes: 10 * 1024 * 1024, // 10 MiB
+            head_max_bytes: 10 * 1024 * 1024,    // 10 MiB
             max_total_bytes: 1024 * 1024 * 1024, // 1 GiB
             max_sealed_batches: 10_000,
             strict_mode: false,

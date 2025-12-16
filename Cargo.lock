@@ -2548,6 +2548,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "arrow-json",
+ "async-trait",
  "bytes",
  "datafusion",
  "serde",
