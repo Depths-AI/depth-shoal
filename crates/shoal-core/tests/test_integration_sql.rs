@@ -25,9 +25,11 @@ async fn test_end_to_end_ingest_and_query() {
                 .unwrap()
                 .clone(),
         )
+        .await
         .unwrap();
     table
         .append_row(json!({"id": 2, "name": "Bob"}).as_object().unwrap().clone())
+        .await
         .unwrap();
 
     let batches = runtime

@@ -31,6 +31,7 @@ async fn test_concurrent_ingest_and_query() {
                         .unwrap()
                         .clone(),
                 )
+                .await
                 .unwrap();
             // Yield occasionally to let readers in, though RwLock should handle fairness
             if i % 1000 == 0 {

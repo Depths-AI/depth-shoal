@@ -31,9 +31,11 @@ async fn test_table_isolation() {
     // Ingest
     table_a
         .append_row(json!({"id": 1, "name": "A"}).as_object().unwrap().clone())
+        .await
         .unwrap();
     table_b
         .append_row(json!({"msg": "log1"}).as_object().unwrap().clone())
+        .await
         .unwrap();
 
     // Query A

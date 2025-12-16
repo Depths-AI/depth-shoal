@@ -1,4 +1,4 @@
-use crate::mem::table::ShoalTable;
+use crate::mem::table::TableHandle;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -9,20 +9,15 @@ use datafusion::prelude::Expr;
 use std::any::Any;
 use std::sync::Arc;
 
-/// A DataFusion TableProvider that wraps a ShoalTable.
-///
-/// This provider creates a new ephemeral `MemTable` for every scan, populated
-/// by a snapshot of the underlying `ShoalTable`. This ensures queries see a
-/// consistent view of the data (sealed tail + head snapshot) without blocking
-/// writers for the duration of the query.
+/// A DataFusion TableProvider that wraps a TableHandle.
 #[derive(Debug)]
 pub struct ShoalTableProvider {
-    table: ShoalTable,
+    handle: TableHandle,
 }
 
 impl ShoalTableProvider {
-    pub fn new(table: ShoalTable) -> Self {
-        Self { table }
+    pub fn new(handle: TableHandle) -> Self {
+        Self { handle }
     }
 }
 
@@ -33,7 +28,7 @@ impl TableProvider for ShoalTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.table.schema()
+        self.handle.schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -48,17 +43,12 @@ impl TableProvider for ShoalTableProvider {
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // 1. Snapshot the table state.
-        // This takes a brief read lock (or write lock, depending on internal implementation)
-        // to clone the sealed batch Arcs and finish_clone the head builders.
-        // The lock is released immediately after this line.
         let (sealed, head) = self
-            .table
+            .handle
             .snapshot()
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         // 2. Construct partitions for the MemTable.
-        // We treat the entire sealed tail + optional head as a single partition for now.
-        // Optimization: We could split this into multiple partitions if parallelism is needed.
         let mut batch_vec = sealed;
         if let Some(h) = head {
             batch_vec.push(h);
@@ -66,7 +56,6 @@ impl TableProvider for ShoalTableProvider {
         let partitions = vec![batch_vec];
 
         // 3. Delegate to DataFusion's MemTable.
-        // MemTable handles the actual physical plan generation (projection, filtering, etc.).
         let mem_table = MemTable::try_new(self.schema(), partitions)?;
 
         mem_table.scan(state, projection, filters, limit).await
@@ -76,11 +65,6 @@ impl TableProvider for ShoalTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
-        // MemTable supports basic filtering, so we can signal 'Inexact' (DataFusion will apply filter)
-        // or just let the default behavior handle it (which is often empty -> unsupported).
-        // For simplicity and correctness with MemTable delegation, we return Unsupported
-        // and let the MemTable's scan logic (which creates a MemoryExec) handle filtering if capable,
-        // or let DataFusion add a FilterExec on top.
         Ok(vec![
             TableProviderFilterPushDown::Unsupported;
             filters.len()

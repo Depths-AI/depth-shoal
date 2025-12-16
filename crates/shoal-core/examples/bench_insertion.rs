@@ -1,21 +1,24 @@
 use serde_json::{json, Value};
-use shoal_core::mem::table::ShoalTable;
+use shoal_core::mem::table::{IngestionWorker, TableHandle, TableState};
 use shoal_core::spec::{ShoalDataType, ShoalField, ShoalSchema, ShoalTableConfig};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
+use tokio::sync::mpsc;
 
 /// Benchmark insertion speed for different payload sizes.
 /// Usage: cargo run -p shoal-core --example bench_insertion --release
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("Running Insertion Benchmark (Single Thread)...");
 
     let sizes = [128, 256, 512, 1024];
 
     for size in sizes {
-        run_benchmark(size);
+        run_benchmark(size).await;
     }
 }
 
-fn run_benchmark(payload_size: usize) {
+async fn run_benchmark(payload_size: usize) {
     // 1. Setup Table
     let schema = ShoalSchema::new(vec![
         ShoalField {
@@ -37,7 +40,14 @@ fn run_benchmark(payload_size: usize) {
         ..Default::default()
     };
 
-    let table = ShoalTable::new(schema, config).unwrap();
+    // Construct Handle + Worker manually (since we don't need full runtime for this bench)
+    let table_state = TableState::new(schema, config).unwrap();
+    let inner = Arc::new(RwLock::new(table_state));
+    let (tx, rx) = mpsc::channel(1024);
+    let worker = IngestionWorker::new(rx, inner.clone());
+
+    tokio::spawn(worker.run());
+    let table = TableHandle::new(tx, inner);
 
     // 2. Pre-generate data (avoid measuring JSON creation time)
     // Create a string of `payload_size` length
@@ -60,7 +70,7 @@ fn run_benchmark(payload_size: usize) {
     // Insert the batch repeatedly until 3 seconds have passed
     while start.elapsed().as_secs() < 3 {
         for row in &rows {
-            table.append_row(row.clone()).unwrap();
+            table.append_row(row.clone()).await.unwrap();
             inserted += 1;
         }
     }

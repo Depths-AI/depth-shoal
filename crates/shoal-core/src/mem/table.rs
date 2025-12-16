@@ -12,11 +12,106 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, RwLock};
+use tokio::sync::{mpsc, oneshot};
+
+// --- Public API ---
+
+/// A handle to a memory table.
+///
+/// This is the public interface for interacting with a table.
+/// - Writes are asynchronous and serialized via an MPSC channel to the [`IngestionWorker`].
+/// - Reads (snapshots) are synchronous and acquire a read lock on the internal state.
+#[derive(Clone, Debug)]
+pub struct TableHandle {
+    tx: mpsc::Sender<IngestMsg>,
+    inner: Arc<RwLock<TableState>>,
+}
+
+impl TableHandle {
+    /// Constructor used by the runtime and tests.
+    pub fn new(tx: mpsc::Sender<IngestMsg>, inner: Arc<RwLock<TableState>>) -> Self {
+        Self { tx, inner }
+    }
+
+    /// Append a single JSON row asynchronously.
+    ///
+    /// This sends the row to the background ingestion worker. The worker enforces schema
+    /// constraints and manages buffering/flushing.
+    ///
+    /// Returns `Ok(())` once the worker has successfully accepted the row.
+    pub async fn append_row(&self, row: serde_json::Map<String, Value>) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let msg = IngestMsg::Append { row, resp: resp_tx };
+
+        self.tx
+            .send(msg)
+            .await
+            .map_err(|_| ShoalError::IngestTypeFailure("Ingestion worker channel closed".into()))?;
+
+        resp_rx.await.map_err(|_| {
+            ShoalError::IngestTypeFailure("Ingestion worker dropped response".into())
+        })?
+    }
+
+    /// Returns a copy of the Arrow schema.
+    pub fn schema(&self) -> SchemaRef {
+        self.inner.read().unwrap().schema.clone()
+    }
+
+    /// Create a consistent snapshot of the table (sealed + head).
+    ///
+    /// This requires a brief write lock to snapshot the head builders.
+    /// Used by the TableProvider for SQL queries.
+    pub fn snapshot(&self) -> Result<(Vec<RecordBatch>, Option<RecordBatch>)> {
+        self.inner.write().unwrap().snapshot()
+    }
+}
+
+// --- Internal Actor Logic ---
+
+/// Messages sent to the ingestion worker.
+pub enum IngestMsg {
+    Append {
+        row: serde_json::Map<String, Value>,
+        resp: oneshot::Sender<Result<()>>,
+    },
+}
+
+/// The background worker that owns the write path for a table.
+pub struct IngestionWorker {
+    rx: mpsc::Receiver<IngestMsg>,
+    inner: Arc<RwLock<TableState>>,
+}
+
+impl IngestionWorker {
+    pub fn new(rx: mpsc::Receiver<IngestMsg>, inner: Arc<RwLock<TableState>>) -> Self {
+        Self { rx, inner }
+    }
+
+    pub async fn run(mut self) {
+        while let Some(msg) = self.rx.recv().await {
+            match msg {
+                IngestMsg::Append { row, resp } => {
+                    // Acquire write lock synchronously to mutate state
+                    // Note: In Phase 3 (WAL), we will write to WAL *before* locking memory.
+                    let result = {
+                        let mut state = self.inner.write().unwrap();
+                        state.append_row_locked(&row)
+                    };
+                    let _ = resp.send(result);
+                }
+            }
+        }
+    }
+}
+
+// --- Storage Engine (Inner State) ---
 
 /// Inner state of the memory table.
 ///
 /// Holds the mutable head (builders) and the sealed tail (RecordBatches).
-struct TableState {
+/// Wrapped in RwLock for reader access.
+pub struct TableState {
     schema: SchemaRef,
     config: ShoalTableConfig,
 
@@ -47,29 +142,28 @@ impl fmt::Debug for TableState {
 }
 
 impl TableState {
-    fn new(schema: SchemaRef, config: ShoalTableConfig) -> Self {
-        let head_builders = schema
+    pub fn new(shoal_schema: ShoalSchema, config: ShoalTableConfig) -> Result<Self> {
+        let arrow_schema: SchemaRef = Arc::new((&shoal_schema).try_into()?);
+        let head_builders = arrow_schema
             .fields()
             .iter()
             .map(|f| make_builder(f.data_type(), config.head_max_rows))
             .collect();
 
-        Self {
-            schema,
+        Ok(Self {
+            schema: arrow_schema,
             config,
             head_builders,
             head_rows: 0,
             head_bytes_estimate: 0,
             sealed: VecDeque::new(),
             sealed_bytes_estimate: 0,
-        }
+        })
     }
 
-    /// Appends a single JSON row to the head.
-    ///
-    /// If strict_mode is on, errors on unknown fields.
-    fn append_row(&mut self, row: &serde_json::Map<String, Value>) -> Result<()> {
-        // 1. Strict mode check: ensure no unknown fields exist in the input row
+    /// Appends a single JSON row to the head (Internal locked method).
+    fn append_row_locked(&mut self, row: &serde_json::Map<String, Value>) -> Result<()> {
+        // 1. Strict mode check
         if self.config.strict_mode {
             for key in row.keys() {
                 if self.schema.field_with_name(key).is_err() {
@@ -78,7 +172,7 @@ impl TableState {
             }
         }
 
-        // 2. Append values for each column in schema order
+        // 2. Append values
         for i in 0..self.schema.fields().len() {
             let field = self.schema.field(i);
             let builder = &mut self.head_builders[i];
@@ -99,6 +193,9 @@ impl TableState {
         }
 
         self.head_rows += 1;
+        self.maybe_flush()?;
+        self.maybe_compact()?;
+        self.maybe_evict();
         Ok(())
     }
 
@@ -114,7 +211,6 @@ impl TableState {
             return Ok(());
         }
 
-        // finish() resets the builders but usually keeps capacity
         let arrays = self
             .head_builders
             .iter_mut()
@@ -135,7 +231,6 @@ impl TableState {
             return Ok(());
         }
 
-        // Compaction strategy: Merge the first K batches
         let k = self.config.compact_trigger_batches;
         let mut batches_to_merge = Vec::with_capacity(k);
         let mut rows_to_merge = 0;
@@ -158,9 +253,7 @@ impl TableState {
             return Ok(());
         }
 
-        // Fix: Pass reference to Vec, which acts as slice of RecordBatch
         let merged_batch = concat_batches(&self.schema, &batches_to_merge)?;
-
         self.sealed_bytes_estimate += merged_batch.get_array_memory_size();
         self.sealed.push_front(merged_batch);
 
@@ -181,10 +274,8 @@ impl TableState {
     }
 
     fn snapshot(&mut self) -> Result<(Vec<RecordBatch>, Option<RecordBatch>)> {
-        // 1. Clone sealed batches (cheap Arc clone)
         let sealed = self.sealed.iter().cloned().collect();
 
-        // 2. Snapshot head using finish_cloned (requires mutable access to builders)
         let head = if self.head_rows > 0 {
             let arrays = self
                 .head_builders
@@ -200,50 +291,7 @@ impl TableState {
     }
 }
 
-/// A handle to a memory table. Thread-safe.
-///
-/// Wraps the internal state in an RwLock.
-#[derive(Clone, Debug)]
-pub struct ShoalTable {
-    inner: Arc<RwLock<TableState>>,
-}
-
-impl ShoalTable {
-    pub fn new(shoal_schema: ShoalSchema, config: ShoalTableConfig) -> Result<Self> {
-        let arrow_schema: SchemaRef = Arc::new((&shoal_schema).try_into()?);
-        let state = TableState::new(arrow_schema, config);
-        Ok(Self {
-            inner: Arc::new(RwLock::new(state)),
-        })
-    }
-
-    /// Returns a copy of the Arrow schema.
-    pub fn schema(&self) -> SchemaRef {
-        self.inner.read().unwrap().schema.clone()
-    }
-
-    /// Append a single JSON row, potentially flushing, compacting, or evicting.
-    ///
-    /// The caller (e.g., ingestion worker) is responsible for framing bytes into JSON objects.
-    pub fn append_row(&self, row: serde_json::Map<String, Value>) -> Result<()> {
-        let mut state = self.inner.write().unwrap();
-        state.append_row(&row)?;
-        state.maybe_flush()?;
-        state.maybe_compact()?;
-        state.maybe_evict();
-        Ok(())
-    }
-
-    /// Create a consistent snapshot of the table (sealed + head).
-    ///
-    /// This requires a brief write lock to snapshot the head builders.
-    pub fn snapshot(&self) -> Result<(Vec<RecordBatch>, Option<RecordBatch>)> {
-        let mut state = self.inner.write().unwrap();
-        state.snapshot()
-    }
-}
-
-// --- Recursive Append Helpers ---
+// --- Recursive Append Helpers (Unchanged) ---
 
 fn append_value_recursive(
     builder: &mut Box<dyn ArrayBuilder>,
@@ -382,7 +430,6 @@ fn append_value_recursive(
                 .downcast_mut::<BinaryBuilder>()
                 .unwrap();
             if let Value::String(s) = val {
-                // Decode hex string to bytes
                 let bytes = (0..s.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
@@ -541,13 +588,10 @@ fn append_null_recursive(builder: &mut Box<dyn ArrayBuilder>, dt: &DataType) -> 
                 .as_any_mut()
                 .downcast_mut::<StructBuilder>()
                 .unwrap();
-            // For StructBuilder, we must append to children to keep lengths in sync,
-            // even if the parent struct slot is null.
             for i in 0..fields.len() {
                 let child = b
                     .field_builder(i)
                     .expect("struct field builder index out of bounds");
-                // Recurse using child field type
                 append_null_recursive(child, fields[i].data_type())?;
             }
             b.append_null();

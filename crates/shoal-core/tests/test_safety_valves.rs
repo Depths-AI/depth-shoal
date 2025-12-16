@@ -1,12 +1,25 @@
 mod common;
 use serde_json::json;
-use shoal_core::mem::table::ShoalTable;
+use shoal_core::mem::table::{IngestionWorker, TableHandle, TableState};
 use shoal_core::spec::ShoalTableConfig;
+use std::sync::{Arc, RwLock};
+use tokio::sync::mpsc;
 
-#[test]
-fn test_eviction_drops_old_data() {
+// Helper to create a handle with custom config
+fn make_table_with_config(config: ShoalTableConfig) -> TableHandle {
     let schema = common::get_test_schema();
+    let table_state = TableState::new(schema, config).unwrap();
+    let inner = Arc::new(RwLock::new(table_state));
+    let (tx, rx) = mpsc::channel(1024);
+    let worker = IngestionWorker::new(rx, inner.clone());
 
+    tokio::spawn(worker.run());
+
+    TableHandle::new(tx, inner)
+}
+
+#[tokio::test]
+async fn test_eviction_drops_old_data() {
     // Config: Allow very little memory (~ enough for 2 batches)
     let config = ShoalTableConfig {
         head_max_rows: 10,     // Small batches
@@ -15,7 +28,7 @@ fn test_eviction_drops_old_data() {
         ..Default::default()
     };
 
-    let table = ShoalTable::new(schema, config).unwrap();
+    let table = make_table_with_config(config);
 
     // Ingest 20 batches (200 rows total)
     // Should trigger eviction multiple times
@@ -27,6 +40,7 @@ fn test_eviction_drops_old_data() {
                     .unwrap()
                     .clone(),
             )
+            .await
             .unwrap();
     }
 
@@ -50,10 +64,8 @@ fn test_eviction_drops_old_data() {
     assert!(ids.value(0) > 0);
 }
 
-#[test]
-fn test_compaction_merges_batches() {
-    let schema = common::get_test_schema();
-
+#[tokio::test]
+async fn test_compaction_merges_batches() {
     let config = ShoalTableConfig {
         head_max_rows: 2,           // Tiny batches
         compact_trigger_batches: 4, // Merge when we hit 4 batches
@@ -61,7 +73,7 @@ fn test_compaction_merges_batches() {
         ..Default::default()
     };
 
-    let table = ShoalTable::new(schema, config).unwrap();
+    let table = make_table_with_config(config);
 
     // Ingest 4 batches (2 rows each) -> 8 rows total
     // Batches: [2], [2], [2], [2] -> Trigger Compaction -> [8]
@@ -73,6 +85,7 @@ fn test_compaction_merges_batches() {
                     .unwrap()
                     .clone(),
             )
+            .await
             .unwrap();
     }
 
