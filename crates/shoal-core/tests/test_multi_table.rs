@@ -38,12 +38,17 @@ async fn test_table_isolation() {
         .await
         .unwrap();
 
+    // Allow worker rotation (default latency is 50ms)
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
     // Query A
     let batches_a = runtime.sql("SELECT * FROM users").await.unwrap();
+    assert!(!batches_a.is_empty(), "Table A should have data");
     assert_eq!(batches_a[0].num_rows(), 1);
 
     // Query B
     let batches_b = runtime.sql("SELECT * FROM logs").await.unwrap();
+    assert!(!batches_b.is_empty(), "Table B should have data");
     assert_eq!(batches_b[0].num_rows(), 1);
 
     // Ensure we can't query cross-table by mistake (names are scoped)

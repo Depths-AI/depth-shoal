@@ -1,5 +1,6 @@
+use arrow::datatypes::Schema as ArrowSchema;
 use serde_json::{json, Value};
-use shoal_core::mem::table::{IngestionWorker, TableHandle, TableState};
+use shoal_core::mem::table::{IngestionWorker, SharedTableState, TableHandle};
 use shoal_core::spec::{ShoalDataType, ShoalField, ShoalSchema, ShoalTableConfig};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -34,23 +35,25 @@ async fn run_benchmark(payload_size: usize) {
     ])
     .unwrap();
 
-    // Configure generous flush thresholds to test raw append speed, not flush speed
+    let arrow_schema: ArrowSchema = (&schema).try_into().unwrap();
+    let arrow_schema_ref = Arc::new(arrow_schema);
+
+    // Configure generous flush thresholds to test raw append speed
     let config = ShoalTableConfig {
-        head_max_rows: 100_000,
+        active_head_max_rows: 100_000, // Large head for bench
         ..Default::default()
     };
 
-    // Construct Handle + Worker manually (since we don't need full runtime for this bench)
-    let table_state = TableState::new(schema, config).unwrap();
-    let inner = Arc::new(RwLock::new(table_state));
+    // Construct Handle + Worker
+    let shared_state = SharedTableState::new(arrow_schema_ref.clone(), config.clone());
+    let inner = Arc::new(RwLock::new(shared_state));
     let (tx, rx) = mpsc::channel(1024);
-    let worker = IngestionWorker::new(rx, inner.clone());
+    let worker = IngestionWorker::new(rx, arrow_schema_ref, config, inner.clone());
 
     tokio::spawn(worker.run());
     let table = TableHandle::new(tx, inner);
 
-    // 2. Pre-generate data (avoid measuring JSON creation time)
-    // Create a string of `payload_size` length
+    // 2. Pre-generate data
     let payload_str = "x".repeat(payload_size);
     let row_count = 100_000;
     let mut rows: Vec<serde_json::Map<String, Value>> = Vec::with_capacity(row_count);
@@ -67,7 +70,6 @@ async fn run_benchmark(payload_size: usize) {
     let start = Instant::now();
     let mut inserted = 0;
 
-    // Insert the batch repeatedly until 3 seconds have passed
     while start.elapsed().as_secs() < 3 {
         for row in &rows {
             table.append_row(row.clone()).await.unwrap();

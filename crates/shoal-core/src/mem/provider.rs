@@ -42,20 +42,13 @@ impl TableProvider for ShoalTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        // 1. Snapshot the table state.
-        let (sealed, head) = self
-            .handle
-            .snapshot()
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        // 1. Snapshot the shared state (Only reads sealed batches, no blocking builders)
+        let batches = self.handle.snapshot();
 
-        // 2. Construct partitions for the MemTable.
-        let mut batch_vec = sealed;
-        if let Some(h) = head {
-            batch_vec.push(h);
-        }
-        let partitions = vec![batch_vec];
+        // 2. Construct MemTable partition
+        let partitions = vec![batches];
 
-        // 3. Delegate to DataFusion's MemTable.
+        // 3. Delegate to DataFusion's MemTable
         let mem_table = MemTable::try_new(self.schema(), partitions)?;
 
         mem_table.scan(state, projection, filters, limit).await
@@ -65,9 +58,6 @@ impl TableProvider for ShoalTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(vec![TableProviderFilterPushDown::Unsupported; filters.len()])
     }
 }

@@ -11,9 +11,10 @@ async fn test_concurrent_ingest_and_query() {
     let schema = common::get_test_schema(); // {id, name}
     let table_ref = ShoalTableRef::new("datafusion", "public", "concurrent").unwrap();
 
-    // Configure frequent flushing to force lock contention on the sealed list
+    // Configure frequent flushing (rotation)
     let config = ShoalTableConfig {
-        head_max_rows: 100, // Flush often
+        active_head_max_rows: 100, // Flush often
+        active_head_max_latency_ms: 10, // Low latency
         ..Default::default()
     };
 
@@ -33,7 +34,7 @@ async fn test_concurrent_ingest_and_query() {
                 )
                 .await
                 .unwrap();
-            // Yield occasionally to let readers in, though RwLock should handle fairness
+            // Yield occasionally
             if i % 1000 == 0 {
                 tokio::task::yield_now().await;
             }
@@ -49,33 +50,44 @@ async fn test_concurrent_ingest_and_query() {
                 .await
                 .unwrap();
 
-            let count = batches[0]
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .unwrap()
-                .value(0);
+            // Handle case where query returns empty if no batches rotated yet
+            if !batches.is_empty() {
+                let count = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap()
+                    .value(0);
 
-            assert!(count >= max_seen, "Count decreased! Eviction not enabled.");
-            max_seen = count;
+                assert!(count >= max_seen, "Count decreased! Eviction not enabled.");
+                max_seen = count;
+            }
             tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
         }
     });
 
     // Wait for writer
     writer_handle.await.unwrap();
+    
+    // Allow final rotation (latency < 100ms)
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
     // Final verify
     let batches = runtime
         .sql("SELECT count(*) FROM concurrent")
         .await
         .unwrap();
-    let final_count = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap()
-        .value(0);
+        
+    let final_count = if batches.is_empty() {
+        0
+    } else {
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0)
+    };
 
     assert_eq!(final_count, 10_000);
 

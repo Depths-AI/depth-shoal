@@ -3,8 +3,9 @@ pub mod table;
 
 use crate::error::Result;
 use crate::mem::provider::ShoalTableProvider;
-use crate::mem::table::{IngestionWorker, TableHandle, TableState};
+use crate::mem::table::{IngestionWorker, SharedTableState, TableHandle};
 use crate::spec::{ShoalRuntimeConfig, ShoalSchema, ShoalTableConfig, ShoalTableRef};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use std::sync::{Arc, RwLock};
@@ -43,28 +44,27 @@ impl ShoalRuntime {
         schema: ShoalSchema,
         table_config: ShoalTableConfig,
     ) -> Result<TableHandle> {
-        // 1. Create the storage state
-        let table_state = TableState::new(schema, table_config)?;
-        let inner = Arc::new(RwLock::new(table_state));
+        // 1. Create the Arrow schema
+        let arrow_schema: SchemaRef = Arc::new((&schema).try_into()?);
 
-        // 2. Create the MPSC channel and worker
-        // Buffer size 1024 is arbitrary but reasonable for ingestion pressure
+        // 2. Create the Shared Read State
+        let shared_state = SharedTableState::new(arrow_schema.clone(), table_config.clone());
+        let shared = Arc::new(RwLock::new(shared_state));
+
+        // 3. Create the MPSC channel
         let (tx, rx) = mpsc::channel(1024);
-        let worker = IngestionWorker::new(rx, inner.clone());
 
-        // 3. Spawn the worker task
+        // 4. Create and Spawn Worker (owns Write State)
+        let worker = IngestionWorker::new(rx, arrow_schema, table_config, shared.clone());
         tokio::spawn(worker.run());
 
-        // 4. Create the public handle (using crate-internal constructor)
-        let handle = TableHandle::new(tx, inner.clone());
+        // 5. Create Handle
+        let handle = TableHandle::new(tx, shared.clone());
 
-        // 5. Create the provider adapter (uses the same shared inner state)
-        // We construct a temporary TableHandle for the provider, or strictly
-        // speaking the provider just needs access to `snapshot`.
-        // We'll wrap the handle in the provider for simplicity.
+        // 6. Create Provider (uses Handle)
         let provider = ShoalTableProvider::new(handle.clone());
 
-        // 6. Register with DataFusion
+        // 7. Register with DataFusion
         let catalog = if table_ref.catalog.as_str().is_empty() {
             &self.config.default_catalog
         } else {

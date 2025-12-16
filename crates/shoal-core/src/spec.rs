@@ -80,11 +80,13 @@ impl Default for ShoalRuntimeConfig {
 /// Configuration for a specific Shoal Memory Table.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShoalTableConfig {
-    /// Flush head to sealed when rows exceed this count.
-    pub head_max_rows: usize,
-    /// Flush head to sealed when estimated bytes exceed this count.
-    pub head_max_bytes: usize,
-    /// Max total bytes (sealed + head) before eviction kicks in.
+    /// Active head max rows before rotation into shared state.
+    /// This controls the "lag" visible to readers. Smaller = lower latency, more small batches.
+    pub active_head_max_rows: usize,
+    /// Active head max latency in milliseconds.
+    pub active_head_max_latency_ms: u64,
+
+    /// Max total bytes (sealed batches) before eviction kicks in.
     pub max_total_bytes: usize,
     /// Max sealed batches before eviction kicks in.
     pub max_sealed_batches: usize,
@@ -99,8 +101,8 @@ pub struct ShoalTableConfig {
 impl Default for ShoalTableConfig {
     fn default() -> Self {
         Self {
-            head_max_rows: 10_000,
-            head_max_bytes: 10 * 1024 * 1024,    // 10 MiB
+            active_head_max_rows: 1000, // Small batches for low latency
+            active_head_max_latency_ms: 50,
             max_total_bytes: 1024 * 1024 * 1024, // 1 GiB
             max_sealed_batches: 10_000,
             strict_mode: false,

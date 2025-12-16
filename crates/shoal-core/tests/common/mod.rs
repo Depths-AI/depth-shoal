@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use shoal_core::mem::table::{IngestionWorker, TableHandle, TableState};
+use arrow::datatypes::Schema as ArrowSchema;
+use shoal_core::mem::table::{IngestionWorker, SharedTableState, TableHandle};
 use shoal_core::spec::{ShoalDataType, ShoalField, ShoalSchema, ShoalTableConfig};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
@@ -27,14 +28,20 @@ pub fn get_test_schema() -> ShoalSchema {
 pub fn make_basic_table() -> TableHandle {
     let schema = get_test_schema();
     let config = ShoalTableConfig::default();
+    
+    // Explicitly type the arrow schema
+    let arrow_schema: ArrowSchema = (&schema).try_into().unwrap();
+    let arrow_schema_ref = Arc::new(arrow_schema);
 
-    // Manual setup similar to ShoalRuntime::create_table
-    let table_state = TableState::new(schema, config).unwrap();
-    let inner = Arc::new(RwLock::new(table_state));
+    // Setup Shared State
+    let shared_state = SharedTableState::new(arrow_schema_ref.clone(), config.clone());
+    let inner = Arc::new(RwLock::new(shared_state));
+    
+    // Setup Channel & Worker
     let (tx, rx) = mpsc::channel(1024);
-    let worker = IngestionWorker::new(rx, inner.clone());
-
+    let worker = IngestionWorker::new(rx, arrow_schema_ref, config, inner.clone());
+    
     tokio::spawn(worker.run());
-
+    
     TableHandle::new(tx, inner)
 }

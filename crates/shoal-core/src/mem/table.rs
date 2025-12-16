@@ -1,5 +1,5 @@
 use crate::error::{Result, ShoalError};
-use crate::spec::{ShoalSchema, ShoalTableConfig};
+use crate::spec::ShoalTableConfig;
 use arrow::array::{
     make_builder, ArrayBuilder, BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder,
     Int32Builder, Int64Builder, ListBuilder, StringBuilder, StructBuilder, UInt32Builder,
@@ -10,8 +10,8 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::fmt;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 // --- Public API ---
@@ -20,25 +20,25 @@ use tokio::sync::{mpsc, oneshot};
 ///
 /// This is the public interface for interacting with a table.
 /// - Writes are asynchronous and serialized via an MPSC channel to the [`IngestionWorker`].
-/// - Reads (snapshots) are synchronous and acquire a read lock on the internal state.
+/// - Reads (snapshots) are synchronous and access [`SharedTableState`].
+/// - Readers and Writers are decoupled: writers append to a private active head,
+///   while readers read from shared state. Rotation happens periodically.
 #[derive(Clone, Debug)]
 pub struct TableHandle {
     tx: mpsc::Sender<IngestMsg>,
-    inner: Arc<RwLock<TableState>>,
+    shared: Arc<RwLock<SharedTableState>>,
 }
 
 impl TableHandle {
     /// Constructor used by the runtime and tests.
-    pub fn new(tx: mpsc::Sender<IngestMsg>, inner: Arc<RwLock<TableState>>) -> Self {
-        Self { tx, inner }
+    pub fn new(tx: mpsc::Sender<IngestMsg>, shared: Arc<RwLock<SharedTableState>>) -> Self {
+        Self { tx, shared }
     }
 
     /// Append a single JSON row asynchronously.
     ///
-    /// This sends the row to the background ingestion worker. The worker enforces schema
-    /// constraints and manages buffering/flushing.
-    ///
-    /// Returns `Ok(())` once the worker has successfully accepted the row.
+    /// This sends the row to the background ingestion worker. The worker adds it to the
+    /// active head. It will be visible to readers after the next rotation (latency < 100ms).
     pub async fn append_row(&self, row: serde_json::Map<String, Value>) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let msg = IngestMsg::Append { row, resp: resp_tx };
@@ -48,28 +48,27 @@ impl TableHandle {
             .await
             .map_err(|_| ShoalError::IngestTypeFailure("Ingestion worker channel closed".into()))?;
 
-        resp_rx.await.map_err(|_| {
-            ShoalError::IngestTypeFailure("Ingestion worker dropped response".into())
-        })?
+        resp_rx
+            .await
+            .map_err(|_| ShoalError::IngestTypeFailure("Ingestion worker dropped response".into()))?
     }
 
     /// Returns a copy of the Arrow schema.
     pub fn schema(&self) -> SchemaRef {
-        self.inner.read().unwrap().schema.clone()
+        self.shared.read().unwrap().schema.clone()
     }
 
-    /// Create a consistent snapshot of the table (sealed + head).
+    /// Get a snapshot of the shared state (sealed batches + rotated chunks).
     ///
-    /// This requires a brief write lock to snapshot the head builders.
-    /// Used by the TableProvider for SQL queries.
-    pub fn snapshot(&self) -> Result<(Vec<RecordBatch>, Option<RecordBatch>)> {
-        self.inner.write().unwrap().snapshot()
+    /// This acquires a READ lock on the shared state. It does NOT touch the active head
+    /// (builders owned by the worker), so it never blocks the writer (except during brief rotation).
+    pub fn snapshot(&self) -> Vec<RecordBatch> {
+        self.shared.read().unwrap().batches.iter().cloned().collect()
     }
 }
 
 // --- Internal Actor Logic ---
 
-/// Messages sent to the ingestion worker.
 pub enum IngestMsg {
     Append {
         row: serde_json::Map<String, Value>,
@@ -77,93 +76,106 @@ pub enum IngestMsg {
     },
 }
 
-/// The background worker that owns the write path for a table.
+/// The background worker that owns the write path.
+/// Contains the `ActiveHead` (builders) which is strictly private and lock-free.
 pub struct IngestionWorker {
     rx: mpsc::Receiver<IngestMsg>,
-    inner: Arc<RwLock<TableState>>,
+    active_head: ActiveHead,
+    shared: Arc<RwLock<SharedTableState>>,
 }
 
 impl IngestionWorker {
-    pub fn new(rx: mpsc::Receiver<IngestMsg>, inner: Arc<RwLock<TableState>>) -> Self {
-        Self { rx, inner }
+    pub fn new(
+        rx: mpsc::Receiver<IngestMsg>,
+        schema: SchemaRef,
+        config: ShoalTableConfig,
+        shared: Arc<RwLock<SharedTableState>>,
+    ) -> Self {
+        Self {
+            rx,
+            active_head: ActiveHead::new(schema, config),
+            shared,
+        }
     }
 
     pub async fn run(mut self) {
-        while let Some(msg) = self.rx.recv().await {
-            match msg {
-                IngestMsg::Append { row, resp } => {
-                    // Acquire write lock synchronously to mutate state
-                    // Note: In Phase 3 (WAL), we will write to WAL *before* locking memory.
-                    let result = {
-                        let mut state = self.inner.write().unwrap();
-                        state.append_row_locked(&row)
-                    };
-                    let _ = resp.send(result);
+        // Interval for time-based rotation checks.
+        // We check at half the latency period to be responsive.
+        let check_interval = Duration::from_millis(
+            (self.active_head.config.active_head_max_latency_ms / 2).max(1),
+        );
+        let mut ticker = tokio::time::interval(check_interval);
+
+        loop {
+            tokio::select! {
+                // Priority 1: Handle incoming messages
+                maybe_msg = self.rx.recv() => {
+                    match maybe_msg {
+                        Some(IngestMsg::Append { row, resp }) => {
+                            let res = self.active_head.append_row(&row);
+                            // Only rotate if successful AND thresholds met (count or time)
+                            if res.is_ok() {
+                                self.check_and_rotate();
+                            }
+                            let _ = resp.send(res);
+                        }
+                        None => {
+                            // Channel closed, worker shuts down
+                            // Optional: flush remaining head? Yes, good practice.
+                            self.force_rotate();
+                            break;
+                        }
+                    }
                 }
+
+                // Priority 2: Time-based rotation check
+                _ = ticker.tick() => {
+                    self.check_and_rotate();
+                }
+            }
+        }
+    }
+
+    fn check_and_rotate(&mut self) {
+        if self.active_head.should_rotate() {
+            self.force_rotate();
+        }
+    }
+
+    fn force_rotate(&mut self) {
+        if let Ok(batch) = self.active_head.rotate() {
+            // Check if batch actually has data (rotate returns empty if no rows)
+            if batch.num_rows() > 0 {
+                let mut shared = self.shared.write().unwrap();
+                shared.push_batch(batch);
             }
         }
     }
 }
 
-// --- Storage Engine (Inner State) ---
+// --- Write-Side State (Private to Worker) ---
 
-/// Inner state of the memory table.
-///
-/// Holds the mutable head (builders) and the sealed tail (RecordBatches).
-/// Wrapped in RwLock for reader access.
-pub struct TableState {
+struct ActiveHead {
     schema: SchemaRef,
     config: ShoalTableConfig,
-
-    /// Mutable head: one builder per field in the schema.
-    head_builders: Vec<Box<dyn ArrayBuilder>>,
-    /// Number of rows currently in the head.
-    head_rows: usize,
-    /// Estimated size of the head in bytes.
-    head_bytes_estimate: usize,
-
-    /// Sealed tail: immutable batches.
-    sealed: VecDeque<RecordBatch>,
-    /// Estimated size of the sealed tail in bytes.
-    sealed_bytes_estimate: usize,
+    builders: Vec<Box<dyn ArrayBuilder>>,
+    current_rows: usize,
+    last_flush: Instant,
 }
 
-impl fmt::Debug for TableState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TableState")
-            .field("schema", &self.schema)
-            .field("config", &self.config)
-            .field("head_rows", &self.head_rows)
-            .field("head_bytes_estimate", &self.head_bytes_estimate)
-            .field("sealed_batches_count", &self.sealed.len())
-            .field("sealed_bytes_estimate", &self.sealed_bytes_estimate)
-            .finish()
-    }
-}
-
-impl TableState {
-    pub fn new(shoal_schema: ShoalSchema, config: ShoalTableConfig) -> Result<Self> {
-        let arrow_schema: SchemaRef = Arc::new((&shoal_schema).try_into()?);
-        let head_builders = arrow_schema
-            .fields()
-            .iter()
-            .map(|f| make_builder(f.data_type(), config.head_max_rows))
-            .collect();
-
-        Ok(Self {
-            schema: arrow_schema,
+impl ActiveHead {
+    fn new(schema: SchemaRef, config: ShoalTableConfig) -> Self {
+        let builders = make_builders(&schema, config.active_head_max_rows);
+        Self {
+            schema,
             config,
-            head_builders,
-            head_rows: 0,
-            head_bytes_estimate: 0,
-            sealed: VecDeque::new(),
-            sealed_bytes_estimate: 0,
-        })
+            builders,
+            current_rows: 0,
+            last_flush: Instant::now(),
+        }
     }
 
-    /// Appends a single JSON row to the head (Internal locked method).
-    fn append_row_locked(&mut self, row: &serde_json::Map<String, Value>) -> Result<()> {
-        // 1. Strict mode check
+    fn append_row(&mut self, row: &serde_json::Map<String, Value>) -> Result<()> {
         if self.config.strict_mode {
             for key in row.keys() {
                 if self.schema.field_with_name(key).is_err() {
@@ -172,10 +184,9 @@ impl TableState {
             }
         }
 
-        // 2. Append values
         for i in 0..self.schema.fields().len() {
             let field = self.schema.field(i);
-            let builder = &mut self.head_builders[i];
+            let builder = &mut self.builders[i];
             let val = row.get(field.name());
 
             match val {
@@ -191,44 +202,78 @@ impl TableState {
                 }
             }
         }
-
-        self.head_rows += 1;
-        self.maybe_flush()?;
-        self.maybe_compact()?;
-        self.maybe_evict();
+        self.current_rows += 1;
         Ok(())
     }
 
-    fn maybe_flush(&mut self) -> Result<()> {
-        if self.head_rows >= self.config.head_max_rows {
-            self.flush()?;
+    fn should_rotate(&self) -> bool {
+        if self.current_rows == 0 {
+            return false;
         }
-        Ok(())
+        if self.current_rows >= self.config.active_head_max_rows {
+            return true;
+        }
+        if self.last_flush.elapsed().as_millis() as u64 >= self.config.active_head_max_latency_ms {
+            return true;
+        }
+        false
     }
 
-    fn flush(&mut self) -> Result<()> {
-        if self.head_rows == 0 {
-            return Ok(());
+    fn rotate(&mut self) -> Result<RecordBatch> {
+        if self.current_rows == 0 {
+            // Return empty batch if nothing to rotate (caller should check num_rows)
+            return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
 
         let arrays = self
-            .head_builders
+            .builders
             .iter_mut()
-            .map(|b| b.finish())
+            .map(|b| b.finish()) // Destructive finish
             .collect::<Vec<_>>();
 
         let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
-        self.sealed_bytes_estimate += batch.get_array_memory_size();
-        self.sealed.push_back(batch);
+        
+        // Reset state
+        self.current_rows = 0;
+        self.last_flush = Instant::now();
+        
+        Ok(batch)
+    }
+}
 
-        self.head_rows = 0;
-        self.head_bytes_estimate = 0;
-        Ok(())
+// --- Read-Side State (Shared) ---
+
+/// Shared state accessed by readers (and updated by worker).
+/// Contains only immutable RecordBatches.
+#[derive(Debug)]
+pub struct SharedTableState {
+    pub schema: SchemaRef,
+    pub config: ShoalTableConfig,
+    pub batches: VecDeque<RecordBatch>,
+    pub bytes_estimate: usize,
+}
+
+impl SharedTableState {
+    pub fn new(schema: SchemaRef, config: ShoalTableConfig) -> Self {
+        Self {
+            schema,
+            config,
+            batches: VecDeque::new(),
+            bytes_estimate: 0,
+        }
     }
 
-    fn maybe_compact(&mut self) -> Result<()> {
-        if self.sealed.len() < self.config.compact_trigger_batches {
-            return Ok(());
+    fn push_batch(&mut self, batch: RecordBatch) {
+        self.bytes_estimate += batch.get_array_memory_size();
+        self.batches.push_back(batch);
+        
+        self.maybe_compact();
+        self.maybe_evict();
+    }
+
+    fn maybe_compact(&mut self) {
+        if self.batches.len() < self.config.compact_trigger_batches {
+            return;
         }
 
         let k = self.config.compact_trigger_batches;
@@ -236,13 +281,11 @@ impl TableState {
         let mut rows_to_merge = 0;
 
         for _ in 0..k {
-            if let Some(b) = self.sealed.pop_front() {
+            if let Some(b) = self.batches.pop_front() {
                 rows_to_merge += b.num_rows();
-                self.sealed_bytes_estimate = self
-                    .sealed_bytes_estimate
-                    .saturating_sub(b.get_array_memory_size());
+                self.bytes_estimate = self.bytes_estimate.saturating_sub(b.get_array_memory_size());
                 batches_to_merge.push(b);
-
+                
                 if rows_to_merge >= self.config.compact_target_rows {
                     break;
                 }
@@ -250,48 +293,40 @@ impl TableState {
         }
 
         if batches_to_merge.is_empty() {
-            return Ok(());
+            return;
         }
 
-        let merged_batch = concat_batches(&self.schema, &batches_to_merge)?;
-        self.sealed_bytes_estimate += merged_batch.get_array_memory_size();
-        self.sealed.push_front(merged_batch);
-
-        Ok(())
-    }
-
-    fn maybe_evict(&mut self) {
-        while (self.sealed_bytes_estimate > self.config.max_total_bytes
-            || self.sealed.len() > self.config.max_sealed_batches)
-            && !self.sealed.is_empty()
-        {
-            if let Some(batch) = self.sealed.pop_front() {
-                self.sealed_bytes_estimate = self
-                    .sealed_bytes_estimate
-                    .saturating_sub(batch.get_array_memory_size());
+        if let Ok(merged) = concat_batches(&self.schema, batches_to_merge.iter()) {
+             self.bytes_estimate += merged.get_array_memory_size();
+             self.batches.push_front(merged);
+        } else {
+            for b in batches_to_merge.into_iter().rev() {
+                self.batches.push_front(b);
             }
         }
     }
 
-    fn snapshot(&mut self) -> Result<(Vec<RecordBatch>, Option<RecordBatch>)> {
-        let sealed = self.sealed.iter().cloned().collect();
-
-        let head = if self.head_rows > 0 {
-            let arrays = self
-                .head_builders
-                .iter_mut()
-                .map(|b| b.finish_cloned())
-                .collect::<Vec<_>>();
-            Some(RecordBatch::try_new(self.schema.clone(), arrays)?)
-        } else {
-            None
-        };
-
-        Ok((sealed, head))
+    fn maybe_evict(&mut self) {
+        while (self.bytes_estimate > self.config.max_total_bytes
+            || self.batches.len() > self.config.max_sealed_batches)
+            && !self.batches.is_empty()
+        {
+            if let Some(batch) = self.batches.pop_front() {
+                self.bytes_estimate = self.bytes_estimate.saturating_sub(batch.get_array_memory_size());
+            }
+        }
     }
 }
 
-// --- Recursive Append Helpers (Unchanged) ---
+// --- Helpers ---
+
+fn make_builders(schema: &SchemaRef, capacity: usize) -> Vec<Box<dyn ArrayBuilder>> {
+    schema
+        .fields()
+        .iter()
+        .map(|f| make_builder(f.data_type(), capacity))
+        .collect()
+}
 
 fn append_value_recursive(
     builder: &mut Box<dyn ArrayBuilder>,
@@ -410,10 +445,7 @@ fn append_value_recursive(
             }
         }
         DataType::Utf8 => {
-            let b = builder
-                .as_any_mut()
-                .downcast_mut::<StringBuilder>()
-                .unwrap();
+            let b = builder.as_any_mut().downcast_mut::<StringBuilder>().unwrap();
             if let Value::String(s) = val {
                 b.append_value(s);
             } else {
@@ -480,10 +512,7 @@ fn append_value_recursive(
             }
         }
         DataType::Struct(fields) => {
-            let b = builder
-                .as_any_mut()
-                .downcast_mut::<StructBuilder>()
-                .unwrap();
+            let b = builder.as_any_mut().downcast_mut::<StructBuilder>().unwrap();
 
             if let Value::Object(map) = val {
                 for (i, field) in fields.iter().enumerate() {
@@ -584,10 +613,7 @@ fn append_null_recursive(builder: &mut Box<dyn ArrayBuilder>, dt: &DataType) -> 
             b.append_null();
         }
         DataType::Struct(fields) => {
-            let b = builder
-                .as_any_mut()
-                .downcast_mut::<StructBuilder>()
-                .unwrap();
+            let b = builder.as_any_mut().downcast_mut::<StructBuilder>().unwrap();
             for i in 0..fields.len() {
                 let child = b
                     .field_builder(i)

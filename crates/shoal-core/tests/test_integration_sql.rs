@@ -32,6 +32,10 @@ async fn test_end_to_end_ingest_and_query() {
         .await
         .unwrap();
 
+    // WAIT: Allow time for the worker to rotate the active head into shared state.
+    // Default config has 50ms latency.
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
     let batches = runtime
         .sql("SELECT * FROM users ORDER BY id")
         .await
