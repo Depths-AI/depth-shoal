@@ -43,6 +43,73 @@ pub type TableName = Ident;
 /// v1 field name (validated identifier).
 pub type FieldName = Ident;
 
+/// Fully qualified table reference for DataFusion catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ShoalTableRef {
+    pub catalog: Ident,
+    pub schema: Ident,
+    pub table: Ident,
+}
+
+impl ShoalTableRef {
+    pub fn new(catalog: &str, schema: &str, table: &str) -> Result<Self> {
+        Ok(Self {
+            catalog: Ident::new(catalog)?,
+            schema: Ident::new(schema)?,
+            table: Ident::new(table)?,
+        })
+    }
+}
+
+/// Configuration for the Shoal Runtime.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShoalRuntimeConfig {
+    pub default_catalog: String,
+    pub default_schema: String,
+}
+
+impl Default for ShoalRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            default_catalog: "datafusion".to_string(),
+            default_schema: "public".to_string(),
+        }
+    }
+}
+
+/// Configuration for a specific Shoal Memory Table.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShoalTableConfig {
+    /// Flush head to sealed when rows exceed this count.
+    pub head_max_rows: usize,
+    /// Flush head to sealed when estimated bytes exceed this count.
+    pub head_max_bytes: usize,
+    /// Max total bytes (sealed + head) before eviction kicks in.
+    pub max_total_bytes: usize,
+    /// Max sealed batches before eviction kicks in.
+    pub max_sealed_batches: usize,
+    /// If true, reject rows with unknown fields.
+    pub strict_mode: bool,
+    /// Trigger compaction when sealed batch count exceeds this.
+    pub compact_trigger_batches: usize,
+    /// Target rows per batch during compaction.
+    pub compact_target_rows: usize,
+}
+
+impl Default for ShoalTableConfig {
+    fn default() -> Self {
+        Self {
+            head_max_rows: 10_000,
+            head_max_bytes: 10 * 1024 * 1024,    // 10 MiB
+            max_total_bytes: 1024 * 1024 * 1024, // 1 GiB
+            max_sealed_batches: 10_000,
+            strict_mode: false,
+            compact_trigger_batches: 50,
+            compact_target_rows: 100_000,
+        }
+    }
+}
+
 /// Shoal table schema data types (v1).
 ///
 /// v1 guarantees:

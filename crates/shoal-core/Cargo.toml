@@ -11,5 +11,11 @@ serde_json = { workspace = true }
 arrow = { workspace = true }
 arrow-json = { workspace = true }
 
+# Phase 2 dependencies
+datafusion = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+bytes = "1.11.0"
+async-trait = "0.1"
+
 [dev-dependencies]
 anyhow = { workspace = true }

@@ -2,6 +2,7 @@ use crate::error::{Result, ShoalError};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow_json::reader::{Decoder, ReaderBuilder};
+use serde_json::Value;
 
 /// Configuration for [`NdjsonDecoder`].
 #[derive(Clone, Debug)]
@@ -107,12 +108,96 @@ impl NdjsonDecoder {
     }
 }
 
+/// A robust framer for NDJSON streams.
+///
+/// Buffers partial lines across chunk boundaries and extracts complete lines
+/// split by `\n`. Trims `\r` and ignores empty lines.
+#[derive(Default, Debug)]
+pub struct NdjsonLineFramer {
+    buffer: Vec<u8>,
+}
+
+impl NdjsonLineFramer {
+    pub fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+
+    /// Appends bytes to the internal buffer and returns any complete lines found.
+    pub fn push_bytes(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+        self.buffer.extend_from_slice(chunk);
+        let mut lines = Vec::new();
+
+        let mut start = 0;
+        // Search for newlines starting from the beginning of the buffer
+        while let Some(mut pos) = self.buffer[start..].iter().position(|&b| b == b'\n') {
+            // .position() is relative to the slice `start..`, so adjust absolute pos
+            pos += start;
+
+            // Extract the line content, excluding the newline
+            let end_payload = if pos > start && self.buffer[pos - 1] == b'\r' {
+                pos - 1
+            } else {
+                pos
+            };
+
+            // Ignore empty lines (e.g., "\n" or "\r\n")
+            if end_payload > start {
+                lines.push(self.buffer[start..end_payload].to_vec());
+            }
+
+            // Advance start to the byte after '\n'
+            start = pos + 1;
+        }
+
+        // Drop processed bytes from the buffer
+        if start > 0 {
+            // Using split_off is a simple way to keep the tail.
+            // Optimized implementations might use a ring buffer or indices, but Vec is fine here.
+            self.buffer = self.buffer.split_off(start);
+        }
+
+        lines
+    }
+
+    /// Returns any remaining bytes in the buffer as a final line, if not empty.
+    pub fn finish(&mut self) -> Option<Vec<u8>> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let mut line = std::mem::take(&mut self.buffer);
+        // Trim trailing \r if present (e.g. stream ended with "...\r")
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+
+        if line.is_empty() {
+            None
+        } else {
+            Some(line)
+        }
+    }
+}
+
+/// Parse a raw JSON line into a `serde_json::Map` object.
+///
+/// Errors if the JSON is invalid or if the root element is not an Object.
+pub fn parse_ndjson_row(line: &[u8]) -> Result<serde_json::Map<String, Value>> {
+    let val: Value = serde_json::from_slice(line).map_err(ShoalError::JsonParse)?;
+    match val {
+        Value::Object(map) => Ok(map),
+        _ => Err(ShoalError::SchemaMismatch(
+            "NDJSON row must be a JSON object".to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::Array;
     use arrow::array::{BinaryArray, Int64Array, ListArray, StringArray, StructArray};
     use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use serde_json::json;
     use std::sync::Arc;
 
     #[test]
@@ -287,5 +372,55 @@ mod tests {
         assert_eq!(ys.value(0), "a");
         assert_eq!(xs.value(1), 2);
         assert_eq!(ys.value(1), "b");
+    }
+
+    #[test]
+    fn framer_handles_chunks_and_newlines() {
+        let mut framer = NdjsonLineFramer::new();
+
+        // 1. Full line in one chunk
+        let lines = framer.push_bytes(b"{\"a\":1}\n");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], b"{\"a\":1}");
+
+        // 2. Split line across chunks
+        let lines = framer.push_bytes(b"{\"b\":");
+        assert!(lines.is_empty());
+        let lines = framer.push_bytes(b"2}\n");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], b"{\"b\":2}");
+
+        // 3. Multiple lines, CRLF, empty lines ignored
+        let chunk = b"{\"c\":3}\r\n\n{\"d\":4}\n";
+        let lines = framer.push_bytes(chunk);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], b"{\"c\":3}");
+        assert_eq!(lines[1], b"{\"d\":4}");
+
+        // 4. Finish with partial line
+        framer.push_bytes(b"{\"e\":5}");
+        let last = framer.finish().unwrap();
+        assert_eq!(last, b"{\"e\":5}");
+    }
+
+    #[test]
+    fn parser_validates_objects() {
+        // Valid object
+        let map = parse_ndjson_row(b"{\"key\": 123}").unwrap();
+        assert_eq!(map["key"], json!(123));
+
+        // Invalid: Array
+        let err = parse_ndjson_row(b"[1, 2]").unwrap_err();
+        match err {
+            ShoalError::SchemaMismatch(msg) => assert!(msg.contains("must be a JSON object")),
+            _ => panic!("Wrong error type"),
+        }
+
+        // Invalid: Malformed JSON
+        let err = parse_ndjson_row(b"{bad").unwrap_err();
+        match err {
+            ShoalError::JsonParse(_) => {}
+            _ => panic!("Expected JsonParse error"),
+        }
     }
 }
