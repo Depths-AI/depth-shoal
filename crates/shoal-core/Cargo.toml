@@ -10,6 +10,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 arrow = { workspace = true }
 arrow-json = { workspace = true }
+datafusion = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+bytes = "1.11.0"
 
 [dev-dependencies]
 anyhow = { workspace = true }
