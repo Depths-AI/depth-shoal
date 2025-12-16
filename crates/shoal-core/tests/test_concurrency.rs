@@ -13,7 +13,7 @@ async fn test_concurrent_ingest_and_query() {
 
     // Configure frequent flushing (rotation)
     let config = ShoalTableConfig {
-        active_head_max_rows: 100, // Flush often
+        active_head_max_rows: 100,      // Flush often
         active_head_max_latency_ms: 10, // Low latency
         ..Default::default()
     };
@@ -68,7 +68,7 @@ async fn test_concurrent_ingest_and_query() {
 
     // Wait for writer
     writer_handle.await.unwrap();
-    
+
     // Allow final rotation (latency < 100ms)
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
@@ -77,7 +77,7 @@ async fn test_concurrent_ingest_and_query() {
         .sql("SELECT count(*) FROM concurrent")
         .await
         .unwrap();
-        
+
     let final_count = if batches.is_empty() {
         0
     } else {

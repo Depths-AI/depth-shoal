@@ -28,7 +28,7 @@ pub fn get_test_schema() -> ShoalSchema {
 pub fn make_basic_table() -> TableHandle {
     let schema = get_test_schema();
     let config = ShoalTableConfig::default();
-    
+
     // Explicitly type the arrow schema
     let arrow_schema: ArrowSchema = (&schema).try_into().unwrap();
     let arrow_schema_ref = Arc::new(arrow_schema);
@@ -36,12 +36,12 @@ pub fn make_basic_table() -> TableHandle {
     // Setup Shared State
     let shared_state = SharedTableState::new(arrow_schema_ref.clone(), config.clone());
     let inner = Arc::new(RwLock::new(shared_state));
-    
+
     // Setup Channel & Worker
     let (tx, rx) = mpsc::channel(1024);
     let worker = IngestionWorker::new(rx, arrow_schema_ref, config, inner.clone());
-    
+
     tokio::spawn(worker.run());
-    
+
     TableHandle::new(tx, inner)
 }

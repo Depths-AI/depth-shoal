@@ -48,9 +48,9 @@ impl TableHandle {
             .await
             .map_err(|_| ShoalError::IngestTypeFailure("Ingestion worker channel closed".into()))?;
 
-        resp_rx
-            .await
-            .map_err(|_| ShoalError::IngestTypeFailure("Ingestion worker dropped response".into()))?
+        resp_rx.await.map_err(|_| {
+            ShoalError::IngestTypeFailure("Ingestion worker dropped response".into())
+        })?
     }
 
     /// Returns a copy of the Arrow schema.
@@ -63,7 +63,13 @@ impl TableHandle {
     /// This acquires a READ lock on the shared state. It does NOT touch the active head
     /// (builders owned by the worker), so it never blocks the writer (except during brief rotation).
     pub fn snapshot(&self) -> Vec<RecordBatch> {
-        self.shared.read().unwrap().batches.iter().cloned().collect()
+        self.shared
+            .read()
+            .unwrap()
+            .batches
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -101,9 +107,8 @@ impl IngestionWorker {
     pub async fn run(mut self) {
         // Interval for time-based rotation checks.
         // We check at half the latency period to be responsive.
-        let check_interval = Duration::from_millis(
-            (self.active_head.config.active_head_max_latency_ms / 2).max(1),
-        );
+        let check_interval =
+            Duration::from_millis((self.active_head.config.active_head_max_latency_ms / 2).max(1));
         let mut ticker = tokio::time::interval(check_interval);
 
         loop {
@@ -232,11 +237,11 @@ impl ActiveHead {
             .collect::<Vec<_>>();
 
         let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
-        
+
         // Reset state
         self.current_rows = 0;
         self.last_flush = Instant::now();
-        
+
         Ok(batch)
     }
 }
@@ -266,7 +271,7 @@ impl SharedTableState {
     fn push_batch(&mut self, batch: RecordBatch) {
         self.bytes_estimate += batch.get_array_memory_size();
         self.batches.push_back(batch);
-        
+
         self.maybe_compact();
         self.maybe_evict();
     }
@@ -283,9 +288,11 @@ impl SharedTableState {
         for _ in 0..k {
             if let Some(b) = self.batches.pop_front() {
                 rows_to_merge += b.num_rows();
-                self.bytes_estimate = self.bytes_estimate.saturating_sub(b.get_array_memory_size());
+                self.bytes_estimate = self
+                    .bytes_estimate
+                    .saturating_sub(b.get_array_memory_size());
                 batches_to_merge.push(b);
-                
+
                 if rows_to_merge >= self.config.compact_target_rows {
                     break;
                 }
@@ -297,8 +304,8 @@ impl SharedTableState {
         }
 
         if let Ok(merged) = concat_batches(&self.schema, batches_to_merge.iter()) {
-             self.bytes_estimate += merged.get_array_memory_size();
-             self.batches.push_front(merged);
+            self.bytes_estimate += merged.get_array_memory_size();
+            self.batches.push_front(merged);
         } else {
             for b in batches_to_merge.into_iter().rev() {
                 self.batches.push_front(b);
@@ -312,7 +319,9 @@ impl SharedTableState {
             && !self.batches.is_empty()
         {
             if let Some(batch) = self.batches.pop_front() {
-                self.bytes_estimate = self.bytes_estimate.saturating_sub(batch.get_array_memory_size());
+                self.bytes_estimate = self
+                    .bytes_estimate
+                    .saturating_sub(batch.get_array_memory_size());
             }
         }
     }
@@ -445,7 +454,10 @@ fn append_value_recursive(
             }
         }
         DataType::Utf8 => {
-            let b = builder.as_any_mut().downcast_mut::<StringBuilder>().unwrap();
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<StringBuilder>()
+                .unwrap();
             if let Value::String(s) = val {
                 b.append_value(s);
             } else {
@@ -512,7 +524,10 @@ fn append_value_recursive(
             }
         }
         DataType::Struct(fields) => {
-            let b = builder.as_any_mut().downcast_mut::<StructBuilder>().unwrap();
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<StructBuilder>()
+                .unwrap();
 
             if let Value::Object(map) = val {
                 for (i, field) in fields.iter().enumerate() {
@@ -613,7 +628,10 @@ fn append_null_recursive(builder: &mut Box<dyn ArrayBuilder>, dt: &DataType) -> 
             b.append_null();
         }
         DataType::Struct(fields) => {
-            let b = builder.as_any_mut().downcast_mut::<StructBuilder>().unwrap();
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<StructBuilder>()
+                .unwrap();
             for i in 0..fields.len() {
                 let child = b
                     .field_builder(i)
