@@ -1,13 +1,8 @@
-use arrow::datatypes::Schema as ArrowSchema;
 use serde_json::{json, Value};
-use shoal_core::mem::table::{IngestionWorker, SharedTableState, TableHandle};
+use shoal_core::mem::table::TableHandle;
 use shoal_core::spec::{ShoalDataType, ShoalField, ShoalSchema, ShoalTableConfig};
-use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use tokio::sync::mpsc;
 
-/// Benchmark insertion speed for different payload sizes.
-/// Usage: cargo run -p shoal-core --example bench_insertion --release
 #[tokio::main]
 async fn main() {
     println!("Running Insertion Benchmark (Single Thread)...");
@@ -20,7 +15,6 @@ async fn main() {
 }
 
 async fn run_benchmark(payload_size: usize) {
-    // 1. Setup Table
     let schema = ShoalSchema::new(vec![
         ShoalField {
             name: "id".parse().unwrap(),
@@ -35,25 +29,14 @@ async fn run_benchmark(payload_size: usize) {
     ])
     .unwrap();
 
-    let arrow_schema: ArrowSchema = (&schema).try_into().unwrap();
-    let arrow_schema_ref = Arc::new(arrow_schema);
-
-    // Configure generous flush thresholds to test raw append speed
     let config = ShoalTableConfig {
-        active_head_max_rows: 100_000, // Large head for bench
+        active_head_max_rows: 100_000,
         ..Default::default()
     };
 
-    // Construct Handle + Worker
-    let shared_state = SharedTableState::new(arrow_schema_ref.clone(), config.clone());
-    let inner = Arc::new(RwLock::new(shared_state));
-    let (tx, rx) = mpsc::channel(1024);
-    let worker = IngestionWorker::new(rx, arrow_schema_ref, config, inner.clone());
+    // Clean public API usage
+    let table = TableHandle::create(schema, config).unwrap();
 
-    tokio::spawn(worker.run());
-    let table = TableHandle::new(tx, inner);
-
-    // 2. Pre-generate data
     let payload_str = "x".repeat(payload_size);
     let row_count = 100_000;
     let mut rows: Vec<serde_json::Map<String, Value>> = Vec::with_capacity(row_count);
@@ -66,7 +49,6 @@ async fn run_benchmark(payload_size: usize) {
         rows.push(row.as_object().unwrap().clone());
     }
 
-    // 3. Run Loop
     let start = Instant::now();
     let mut inserted = 0;
 

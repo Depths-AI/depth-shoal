@@ -1,5 +1,6 @@
 use crate::error::{Result, ShoalError};
-use crate::spec::ShoalTableConfig;
+use crate::spec::{ShoalSchema, ShoalTableConfig};
+use arc_swap::ArcSwap;
 use arrow::array::{
     make_builder, ArrayBuilder, BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder,
     Int32Builder, Int64Builder, ListBuilder, StringBuilder, StructBuilder, UInt32Builder,
@@ -10,7 +11,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -26,19 +27,43 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Clone, Debug)]
 pub struct TableHandle {
     tx: mpsc::Sender<IngestMsg>,
-    shared: Arc<RwLock<SharedTableState>>,
+    // Readers access this atomic pointer. No locking required.
+    snapshot: Arc<ArcSwap<TableSnapshot>>,
 }
 
 impl TableHandle {
-    /// Constructor used by the runtime and tests.
-    pub fn new(tx: mpsc::Sender<IngestMsg>, shared: Arc<RwLock<SharedTableState>>) -> Self {
-        Self { tx, shared }
+    /// Create a new standalone table with the given schema and configuration.
+    ///
+    /// This spawns the background ingestion worker and returns a handle.
+    /// Use this if you don't need the full `ShoalRuntime` / SQL integration.
+    pub fn create(schema: ShoalSchema, config: ShoalTableConfig) -> Result<Self> {
+        let arrow_schema: SchemaRef = Arc::new((&schema).try_into()?);
+
+        // Initial empty snapshot
+        let initial_snapshot = TableSnapshot {
+            schema: arrow_schema.clone(),
+            batches: Vec::new(),
+            bytes_estimate: 0,
+        };
+        let snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
+
+        // Create MPSC channel
+        let (tx, rx) = mpsc::channel(1024);
+
+        // Spawn Worker
+        let worker = IngestionWorker::new(rx, arrow_schema, config, snapshot.clone());
+        tokio::spawn(worker.run());
+
+        Ok(Self { tx, snapshot })
+    }
+
+    /// Internal constructor used by the runtime if it needs to share state setup.
+    /// (Ideally runtime should just use create() too, but runtime registers with DF).
+    pub(crate) fn new(tx: mpsc::Sender<IngestMsg>, snapshot: Arc<ArcSwap<TableSnapshot>>) -> Self {
+        Self { tx, snapshot }
     }
 
     /// Append a single JSON row asynchronously.
-    ///
-    /// This sends the row to the background ingestion worker. The worker adds it to the
-    /// active head. It will be visible to readers after the next rotation (latency < 100ms).
     pub async fn append_row(&self, row: serde_json::Map<String, Value>) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let msg = IngestMsg::Append { row, resp: resp_tx };
@@ -55,25 +80,26 @@ impl TableHandle {
 
     /// Returns a copy of the Arrow schema.
     pub fn schema(&self) -> SchemaRef {
-        self.shared.read().unwrap().schema.clone()
+        self.snapshot.load().schema.clone()
     }
 
-    /// Get a snapshot of the shared state (sealed batches + rotated chunks).
+    /// Get a consistent snapshot of the sealed state.
     ///
-    /// This acquires a READ lock on the shared state. It does NOT touch the active head
-    /// (builders owned by the worker), so it never blocks the writer (except during brief rotation).
+    /// This is wait-free. It loads the current pointer from ArcSwap.
     pub fn snapshot(&self) -> Vec<RecordBatch> {
-        self.shared
-            .read()
-            .unwrap()
-            .batches
-            .iter()
-            .cloned()
-            .collect()
+        self.snapshot.load().batches.to_vec()
     }
 }
 
-// --- Internal Actor Logic ---
+// --- Internal Data Structures ---
+
+/// Immutable snapshot of the table state visible to readers.
+#[derive(Debug)]
+pub struct TableSnapshot {
+    pub schema: SchemaRef,
+    pub batches: Vec<RecordBatch>, // Flattened view
+    pub bytes_estimate: usize,
+}
 
 pub enum IngestMsg {
     Append {
@@ -83,11 +109,13 @@ pub enum IngestMsg {
 }
 
 /// The background worker that owns the write path.
-/// Contains the `ActiveHead` (builders) which is strictly private and lock-free.
 pub struct IngestionWorker {
     rx: mpsc::Receiver<IngestMsg>,
     active_head: ActiveHead,
-    shared: Arc<RwLock<SharedTableState>>,
+    // The mutable "Source of Truth" for the tail
+    write_state: WriteSideTail,
+    // The atomic pointer to update
+    snapshot: Arc<ArcSwap<TableSnapshot>>,
 }
 
 impl IngestionWorker {
@@ -95,45 +123,38 @@ impl IngestionWorker {
         rx: mpsc::Receiver<IngestMsg>,
         schema: SchemaRef,
         config: ShoalTableConfig,
-        shared: Arc<RwLock<SharedTableState>>,
+        snapshot: Arc<ArcSwap<TableSnapshot>>,
     ) -> Self {
         Self {
             rx,
-            active_head: ActiveHead::new(schema, config),
-            shared,
+            active_head: ActiveHead::new(schema.clone(), config.clone()),
+            write_state: WriteSideTail::new(schema, config),
+            snapshot,
         }
     }
 
     pub async fn run(mut self) {
-        // Interval for time-based rotation checks.
-        // We check at half the latency period to be responsive.
         let check_interval =
             Duration::from_millis((self.active_head.config.active_head_max_latency_ms / 2).max(1));
         let mut ticker = tokio::time::interval(check_interval);
 
         loop {
             tokio::select! {
-                // Priority 1: Handle incoming messages
                 maybe_msg = self.rx.recv() => {
                     match maybe_msg {
                         Some(IngestMsg::Append { row, resp }) => {
                             let res = self.active_head.append_row(&row);
-                            // Only rotate if successful AND thresholds met (count or time)
                             if res.is_ok() {
                                 self.check_and_rotate();
                             }
                             let _ = resp.send(res);
                         }
                         None => {
-                            // Channel closed, worker shuts down
-                            // Optional: flush remaining head? Yes, good practice.
                             self.force_rotate();
                             break;
                         }
                     }
                 }
-
-                // Priority 2: Time-based rotation check
                 _ = ticker.tick() => {
                     self.check_and_rotate();
                 }
@@ -148,30 +169,34 @@ impl IngestionWorker {
     }
 
     fn force_rotate(&mut self) {
-        // Fix #5: Handle rotation failure explicitly
         match self.active_head.rotate() {
             Ok(batch) => {
-                // Check if batch actually has data (rotate returns empty if no rows)
                 if batch.num_rows() > 0 {
-                    let mut shared = self.shared.write().unwrap();
-                    shared.push_batch(batch);
+                    // 1. Mutate private state (cheap, no lock)
+                    self.write_state.push_batch(batch);
+
+                    // 2. Publish new snapshot (ArcSwap)
+                    self.publish_snapshot();
                 }
             }
             Err(e) => {
-                // Critical failure in rotation (e.g., arrow error).
-                // We cannot push partial/corrupt state. We must log and drop.
-                // In a production system, this should likely trigger a circuit breaker.
                 eprintln!(
                     "CRITICAL: ActiveHead rotation failed: {}. Data loss occurred.",
                     e
                 );
-
-                // Reset the active head to a clean state to allow future appends
-                // (rotate() mostly does this, but if it failed partway, we might need a harder reset.
-                // Currently rotate() re-initializes `last_flush` but builders state depends on where it failed.
-                // For now, we assume builders are recoverable or broken. If broken, next append will fail too.)
             }
         }
+    }
+
+    fn publish_snapshot(&self) {
+        // Construct the immutable view
+        let view = TableSnapshot {
+            schema: self.write_state.schema.clone(),
+            batches: self.write_state.batches.iter().cloned().collect(),
+            bytes_estimate: self.write_state.bytes_estimate,
+        };
+        // Atomic swap
+        self.snapshot.store(Arc::new(view));
     }
 }
 
@@ -243,19 +268,16 @@ impl ActiveHead {
 
     fn rotate(&mut self) -> Result<RecordBatch> {
         if self.current_rows == 0 {
-            // Return empty batch if nothing to rotate (caller should check num_rows)
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
 
         let arrays = self
             .builders
             .iter_mut()
-            .map(|b| b.finish()) // Destructive finish
+            .map(|b| b.finish())
             .collect::<Vec<_>>();
 
         let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
-
-        // Reset state
         self.current_rows = 0;
         self.last_flush = Instant::now();
 
@@ -263,20 +285,17 @@ impl ActiveHead {
     }
 }
 
-// --- Read-Side State (Shared) ---
+// --- Write-Side Tail (Worker's Private Mutable Tail) ---
 
-/// Shared state accessed by readers (and updated by worker).
-/// Contains only immutable RecordBatches.
-#[derive(Debug)]
-pub struct SharedTableState {
-    pub schema: SchemaRef,
-    pub config: ShoalTableConfig,
-    pub batches: VecDeque<RecordBatch>,
-    pub bytes_estimate: usize,
+struct WriteSideTail {
+    schema: SchemaRef,
+    config: ShoalTableConfig,
+    batches: VecDeque<RecordBatch>,
+    bytes_estimate: usize,
 }
 
-impl SharedTableState {
-    pub fn new(schema: SchemaRef, config: ShoalTableConfig) -> Self {
+impl WriteSideTail {
+    fn new(schema: SchemaRef, config: ShoalTableConfig) -> Self {
         Self {
             schema,
             config,
@@ -294,8 +313,6 @@ impl SharedTableState {
     }
 
     fn maybe_compact(&mut self) {
-        // Fix #1: Transactional compaction to prevent bytes_estimate corruption
-
         if self.batches.len() < self.config.compact_trigger_batches {
             return;
         }
@@ -306,9 +323,7 @@ impl SharedTableState {
         let mut local_bytes_accum = 0;
         let mut rows_to_merge = 0;
 
-        // 1. Accumulate candidates locally, do NOT touch self.bytes_estimate yet
         for _ in 0..k {
-            // Peek at the front. If we take it, we commit to trying merge.
             if let Some(b) = self.batches.pop_front() {
                 rows_to_merge += b.num_rows();
                 local_bytes_accum += b.get_array_memory_size();
@@ -326,16 +341,11 @@ impl SharedTableState {
             return;
         }
 
-        // 2. Attempt Merge
-        // Just pass iterator directly, avoiding the intermediate Vec<&RecordBatch> type dance
         if let Ok(merged) = concat_batches(&self.schema, batches_to_merge.iter()) {
-            // 3. Success: Commit the change to stats
             self.bytes_estimate = self.bytes_estimate.saturating_sub(local_bytes_accum);
             self.bytes_estimate += merged.get_array_memory_size();
             self.batches.push_front(merged);
         } else {
-            // 4. Failure: Revert changes (Push back).
-            // Do NOT touch self.bytes_estimate, so it remains consistent with the batches being put back.
             for b in batches_to_merge.into_iter().rev() {
                 self.batches.push_front(b);
             }
@@ -357,7 +367,7 @@ impl SharedTableState {
     }
 }
 
-// --- Helpers ---
+// --- Helpers (Unchanged) ---
 
 fn make_builders(schema: &SchemaRef, capacity: usize) -> Vec<Box<dyn ArrayBuilder>> {
     schema

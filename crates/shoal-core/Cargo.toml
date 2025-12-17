@@ -16,6 +16,7 @@ datafusion = { workspace = true }
 tokio = { workspace = true, features = ["sync", "macros", "rt","time"] }
 bytes = "1.11.0"
 async-trait = "0.1"
+arc-swap = "1.7"
 
 [dev-dependencies]
 anyhow = { workspace = true }

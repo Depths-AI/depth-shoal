@@ -9,7 +9,6 @@ use datafusion::prelude::Expr;
 use std::any::Any;
 use std::sync::Arc;
 
-/// A DataFusion TableProvider that wraps a TableHandle.
 #[derive(Debug)]
 pub struct ShoalTableProvider {
     handle: TableHandle,
@@ -42,10 +41,11 @@ impl TableProvider for ShoalTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        // 1. Snapshot the shared state (Only reads sealed batches, no blocking builders)
+        // 1. Snapshot via ArcSwap (Wait-free)
         let batches = self.handle.snapshot();
 
-        // 2. Construct MemTable partition
+        // 2. Construct partitions
+        // Note: batches is Vec<RecordBatch>, partitions is Vec<Vec<RecordBatch>>
         let partitions = vec![batches];
 
         // 3. Delegate to DataFusion's MemTable
