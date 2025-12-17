@@ -13,7 +13,7 @@ arrow-json = { workspace = true }
 
 # Phase 2 dependencies
 datafusion = { workspace = true }
-tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+tokio = { workspace = true, features = ["sync", "macros", "rt","time"] }
 bytes = "1.11.0"
 async-trait = "0.1"
 

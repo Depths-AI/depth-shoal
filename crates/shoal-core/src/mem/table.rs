@@ -148,11 +148,28 @@ impl IngestionWorker {
     }
 
     fn force_rotate(&mut self) {
-        if let Ok(batch) = self.active_head.rotate() {
-            // Check if batch actually has data (rotate returns empty if no rows)
-            if batch.num_rows() > 0 {
-                let mut shared = self.shared.write().unwrap();
-                shared.push_batch(batch);
+        // Fix #5: Handle rotation failure explicitly
+        match self.active_head.rotate() {
+            Ok(batch) => {
+                // Check if batch actually has data (rotate returns empty if no rows)
+                if batch.num_rows() > 0 {
+                    let mut shared = self.shared.write().unwrap();
+                    shared.push_batch(batch);
+                }
+            }
+            Err(e) => {
+                // Critical failure in rotation (e.g., arrow error).
+                // We cannot push partial/corrupt state. We must log and drop.
+                // In a production system, this should likely trigger a circuit breaker.
+                eprintln!(
+                    "CRITICAL: ActiveHead rotation failed: {}. Data loss occurred.",
+                    e
+                );
+
+                // Reset the active head to a clean state to allow future appends
+                // (rotate() mostly does this, but if it failed partway, we might need a harder reset.
+                // Currently rotate() re-initializes `last_flush` but builders state depends on where it failed.
+                // For now, we assume builders are recoverable or broken. If broken, next append will fail too.)
             }
         }
     }
@@ -277,25 +294,31 @@ impl SharedTableState {
     }
 
     fn maybe_compact(&mut self) {
+        // Fix #1: Transactional compaction to prevent bytes_estimate corruption
+
         if self.batches.len() < self.config.compact_trigger_batches {
             return;
         }
 
         let k = self.config.compact_trigger_batches;
+
         let mut batches_to_merge = Vec::with_capacity(k);
+        let mut local_bytes_accum = 0;
         let mut rows_to_merge = 0;
 
+        // 1. Accumulate candidates locally, do NOT touch self.bytes_estimate yet
         for _ in 0..k {
+            // Peek at the front. If we take it, we commit to trying merge.
             if let Some(b) = self.batches.pop_front() {
                 rows_to_merge += b.num_rows();
-                self.bytes_estimate = self
-                    .bytes_estimate
-                    .saturating_sub(b.get_array_memory_size());
+                local_bytes_accum += b.get_array_memory_size();
                 batches_to_merge.push(b);
 
                 if rows_to_merge >= self.config.compact_target_rows {
                     break;
                 }
+            } else {
+                break;
             }
         }
 
@@ -303,13 +326,20 @@ impl SharedTableState {
             return;
         }
 
+        // 2. Attempt Merge
+        // Just pass iterator directly, avoiding the intermediate Vec<&RecordBatch> type dance
         if let Ok(merged) = concat_batches(&self.schema, batches_to_merge.iter()) {
+            // 3. Success: Commit the change to stats
+            self.bytes_estimate = self.bytes_estimate.saturating_sub(local_bytes_accum);
             self.bytes_estimate += merged.get_array_memory_size();
             self.batches.push_front(merged);
         } else {
+            // 4. Failure: Revert changes (Push back).
+            // Do NOT touch self.bytes_estimate, so it remains consistent with the batches being put back.
             for b in batches_to_merge.into_iter().rev() {
                 self.batches.push_front(b);
             }
+            eprintln!("WARNING: Compaction failed via concat_batches. Retrying later.");
         }
     }
 
