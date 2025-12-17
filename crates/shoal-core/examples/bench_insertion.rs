@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::json;
 use shoal_core::mem::table::TableHandle;
 use shoal_core::spec::{ShoalDataType, ShoalField, ShoalSchema, ShoalTableConfig};
 use std::time::Instant;
@@ -34,27 +34,30 @@ async fn run_benchmark(payload_size: usize) {
         ..Default::default()
     };
 
-    // Clean public API usage
     let table = TableHandle::create(schema, config).unwrap();
 
     let payload_str = "x".repeat(payload_size);
     let row_count = 100_000;
-    let mut rows: Vec<serde_json::Map<String, Value>> = Vec::with_capacity(row_count);
 
+    // Pre-serialize rows to simulate raw byte stream ingestion
+    // This tests the `append_bytes` path directly
+    let mut chunks: Vec<bytes::Bytes> = Vec::with_capacity(row_count);
     for i in 0..row_count {
         let row = json!({
             "id": i as i64,
             "payload": payload_str
         });
-        rows.push(row.as_object().unwrap().clone());
+        let mut b = serde_json::to_vec(&row).unwrap();
+        b.push(b'\n'); // NDJSON
+        chunks.push(bytes::Bytes::from(b));
     }
 
     let start = Instant::now();
     let mut inserted = 0;
 
     while start.elapsed().as_secs() < 3 {
-        for row in &rows {
-            table.append_row(row.clone()).await.unwrap();
+        for chunk in &chunks {
+            table.append_bytes(chunk.clone()).await.unwrap();
             inserted += 1;
         }
     }

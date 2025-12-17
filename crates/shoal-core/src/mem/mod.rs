@@ -38,31 +38,24 @@ impl ShoalRuntime {
         schema: ShoalSchema,
         table_config: ShoalTableConfig,
     ) -> Result<TableHandle> {
-        // 1. Create the Arrow schema
         let arrow_schema: SchemaRef = Arc::new((&schema).try_into()?);
 
-        // 2. Create initial snapshot (Empty)
         let initial_snapshot = TableSnapshot {
             schema: arrow_schema.clone(),
             batches: Vec::new(),
             bytes_estimate: 0,
         };
-        let shared = Arc::new(ArcSwap::from_pointee(initial_snapshot));
+        let snapshot = Arc::new(ArcSwap::from_pointee(initial_snapshot));
 
-        // 3. Create Channel
         let (tx, rx) = mpsc::channel(1024);
 
-        // 4. Spawn Worker (owns Write State)
-        let worker = IngestionWorker::new(rx, arrow_schema, table_config, shared.clone());
+        // Fix: Use '?' to handle the Result returned by IngestionWorker::new
+        let worker = IngestionWorker::new(rx, arrow_schema, table_config, snapshot.clone())?;
         tokio::spawn(worker.run());
 
-        // 5. Create Handle
-        let handle = TableHandle::new(tx, shared.clone());
-
-        // 6. Create Provider
+        let handle = TableHandle::new(tx, snapshot.clone());
         let provider = ShoalTableProvider::new(handle.clone());
 
-        // 7. Register
         let catalog = if table_ref.catalog.as_str().is_empty() {
             &self.config.default_catalog
         } else {
